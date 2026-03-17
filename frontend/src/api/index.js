@@ -49,4 +49,6 @@ export const scoreAPI = {
   downloadTemplate: (params) => request.get("/scores/download_template/", { params, responseType: "blob" }),
   importScores: (formData) => request.post("/scores/import_scores/", formData, { headers: { "Content-Type": "multipart/form-data" } }),
   importWorkbook: (formData) => request.post("/scores/import_workbook/", formData, { headers: { "Content-Type": "multipart/form-data" } }),
+  parseTextScores: (data) => request.post("/scores/parse_text_scores/", data),
+  importTextScores: (data) => request.post("/scores/import_text_scores/", data),
 }

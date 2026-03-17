@@ -1,10 +1,12 @@
 import csv
+import re
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, TextIOWrapper
 
 from django.db.models import Avg, Count, Max, Min, Q
 from django.http import HttpResponse
 from openpyxl import Workbook, load_workbook
+from pypinyin import Style, lazy_pinyin, pinyin
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -21,7 +23,16 @@ from .serializers import (
     ScoreDetailSerializer,
     ScoreImportSerializer,
     ScoreSerializer,
+    ScoreTextImportConfirmSerializer,
+    ScoreTextParseSerializer,
 )
+
+
+HEADER_STUDENT_ID = "学号"
+HEADER_CANDIDATE_ID = "考号"
+HEADER_NAME = "姓名"
+HEADER_CLASS = "班级"
+HEADER_SCORE = "成绩"
 
 
 class ScoreViewSet(viewsets.ModelViewSet):
@@ -48,6 +59,10 @@ class ScoreViewSet(viewsets.ModelViewSet):
             return ScoreCreateUpdateSerializer
         if self.action == "import_scores":
             return ScoreImportSerializer
+        if self.action == "parse_text_scores":
+            return ScoreTextParseSerializer
+        if self.action == "import_text_scores":
+            return ScoreTextImportConfirmSerializer
         return ScoreSerializer
 
     def perform_create(self, serializer):
@@ -62,7 +77,7 @@ class ScoreViewSet(viewsets.ModelViewSet):
         sheet = workbook.active
 
         if template_type == "multi":
-            headers = ["学号", "姓名", "班级"]
+            headers = [HEADER_STUDENT_ID, HEADER_NAME, HEADER_CLASS]
             if exam_id:
                 exam = Exam.objects.filter(id=exam_id).first()
                 if exam:
@@ -72,10 +87,11 @@ class ScoreViewSet(viewsets.ModelViewSet):
                 headers.extend(["语文", "数学", "英语"])
             sheet.title = "scores_multi"
             sheet.append(headers)
-            sheet.append(["2024001", "张三", "一年级1班", 95, 96, 97][: len(headers)])
+            sample = ["2024001", "张三", "一年级1班", 95, 96, 97]
+            sheet.append(sample[: len(headers)])
         else:
             sheet.title = "scores_single"
-            sheet.append(["学号", "姓名", "班级", "成绩"])
+            sheet.append([HEADER_STUDENT_ID, HEADER_NAME, HEADER_CLASS, HEADER_SCORE])
             sheet.append(["2024001", "张三", "一年级1班", 95])
 
         buffer = BytesIO()
@@ -130,12 +146,14 @@ class ScoreViewSet(viewsets.ModelViewSet):
             class_obj = self._match_class(sheet_name, all_classes)
             if not class_obj:
                 continue
+
             sheet = workbook[sheet_name]
             headers = [cell.value for cell in sheet[3]]
             rows = [{headers[i]: row[i] for i in range(len(headers))} for row in sheet.iter_rows(min_row=4, values_only=True)]
             subject_map = self._resolve_subject_columns(headers, None)
             if isinstance(subject_map, Response):
                 continue
+
             result = self._save_rows(request, exam, rows, subject_map, class_obj=class_obj)
             success_count += result["success_count"]
             errors.extend(result["errors"])
@@ -149,6 +167,82 @@ class ScoreViewSet(viewsets.ModelViewSet):
                 "errors": errors[:50],
             }
         )
+
+    @action(detail=False, methods=["post"])
+    def parse_text_scores(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        exam = Exam.objects.filter(id=serializer.validated_data["exam_id"]).first()
+        subject = Subject.objects.filter(id=serializer.validated_data["subject_id"]).first()
+        if not exam or not subject:
+            return Response({"error": "考试或科目不存在"}, status=status.HTTP_400_BAD_REQUEST)
+
+        class_obj = None
+        class_id = serializer.validated_data.get("class_id")
+        if class_id:
+            class_obj = self._class_queryset(request.user).filter(id=class_id).first()
+            if not class_obj:
+                return Response({"error": "班级不存在或无权限"}, status=status.HTTP_400_BAD_REQUEST)
+
+        records, errors = self._parse_text_records(
+            request.user,
+            serializer.validated_data["text"],
+            subject,
+            class_obj=class_obj,
+        )
+        return Response(
+            {
+                "matched_count": len(records),
+                "error_count": len(errors),
+                "records": records,
+                "errors": errors,
+            }
+        )
+
+    @action(detail=False, methods=["post"])
+    def import_text_scores(self, request):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        exam = Exam.objects.filter(id=serializer.validated_data["exam_id"]).first()
+        subject = Subject.objects.filter(id=serializer.validated_data["subject_id"]).first()
+        if not exam or not subject:
+            return Response({"error": "考试或科目不存在"}, status=status.HTTP_400_BAD_REQUEST)
+
+        students = self._student_queryset(request.user)
+        success_count = 0
+        errors = []
+
+        for index, record in enumerate(serializer.validated_data["records"], start=1):
+            student = students.filter(id=record.get("student_id")).first()
+            if not student:
+                errors.append(f"第 {index} 条学生不存在或无权限")
+                continue
+
+            try:
+                score_value = Decimal(str(record.get("score")))
+            except (InvalidOperation, TypeError):
+                errors.append(f"第 {index} 条分数格式错误")
+                continue
+
+            if score_value < 0 or score_value > subject.full_score:
+                errors.append(f"第 {index} 条分数超出范围")
+                continue
+
+            Score.objects.update_or_create(
+                student=student,
+                exam=exam,
+                subject=subject,
+                defaults={
+                    "score": score_value,
+                    "created_by": request.user,
+                    "notes": record.get("notes", "文本批量导入"),
+                },
+            )
+            success_count += 1
+
+        return Response({"message": "导入完成", "success_count": success_count, "errors": errors})
 
     def _read_rows(self, file):
         if file.name.endswith(".csv"):
@@ -165,10 +259,10 @@ class ScoreViewSet(viewsets.ModelViewSet):
             subject = Subject.objects.filter(id=subject_id).first()
             if not subject:
                 return Response({"error": "科目不存在"}, status=status.HTTP_400_BAD_REQUEST)
-            return [{"name": subject.name, "subject": subject, "column": "成绩"}]
+            return [{"name": subject.name, "subject": subject, "column": HEADER_SCORE}]
 
         subject_columns = []
-        ignored = {"学号", "考号", "姓名", "班级", "性别", "序号", None, ""}
+        ignored = {HEADER_STUDENT_ID, HEADER_CANDIDATE_ID, HEADER_NAME, HEADER_CLASS, "性别", "序号", None, ""}
         for column in columns:
             if column in ignored:
                 continue
@@ -187,21 +281,22 @@ class ScoreViewSet(viewsets.ModelViewSet):
         for index, row in enumerate(rows, start=2):
             student = self._find_student(request.user, row, class_obj)
             if not student:
-                errors.append(f"第{index}行: 未找到学生")
+                errors.append(f"第 {index} 行未找到学生")
                 continue
 
             for subject_info in subject_columns:
                 raw_value = row.get(subject_info["column"])
                 if raw_value in [None, "", "None"]:
                     continue
+
                 try:
                     score_value = Decimal(str(raw_value).strip())
                 except (InvalidOperation, AttributeError):
-                    errors.append(f"第{index}行: {subject_info['name']} 分数格式错误")
+                    errors.append(f"第 {index} 行 {subject_info['name']} 分数格式错误")
                     continue
 
                 if score_value < 0 or score_value > subject_info["subject"].full_score:
-                    errors.append(f"第{index}行: {subject_info['name']} 分数超范围")
+                    errors.append(f"第 {index} 行 {subject_info['name']} 分数超出范围")
                     continue
 
                 Score.objects.update_or_create(
@@ -214,6 +309,14 @@ class ScoreViewSet(viewsets.ModelViewSet):
 
         return {"message": "导入完成", "success_count": success_count, "errors": errors}
 
+    def _student_queryset(self, user):
+        queryset = Student.objects.select_related("class_obj").all()
+        if getattr(user, "school", None):
+            queryset = queryset.filter(class_obj__school=user.school)
+        if user.is_admin:
+            return queryset
+        return queryset.filter(class_obj__head_teacher=user)
+
     def _class_queryset(self, user):
         queryset = Class.objects.all()
         if getattr(user, "school", None):
@@ -223,23 +326,19 @@ class ScoreViewSet(viewsets.ModelViewSet):
         return queryset.filter(head_teacher=user)
 
     def _find_student(self, user, row, matched_class=None):
-        queryset = Student.objects.select_related("class_obj").all()
-        if getattr(user, "school", None):
-            queryset = queryset.filter(class_obj__school=user.school)
-        if not user.is_admin:
-            queryset = queryset.filter(class_obj__head_teacher=user)
+        queryset = self._student_queryset(user)
 
-        student_id = str(row.get("学号") or row.get("考号") or "").strip()
+        student_id = str(row.get(HEADER_STUDENT_ID) or row.get(HEADER_CANDIDATE_ID) or "").strip()
         if student_id:
             student = queryset.filter(student_id=student_id).first()
             if student:
                 return student
 
-        student_name = str(row.get("姓名") or "").strip()
+        student_name = str(row.get(HEADER_NAME) or "").strip()
         if not student_name:
             return None
 
-        class_name = str(row.get("班级") or "").strip()
+        class_name = str(row.get(HEADER_CLASS) or "").strip()
         class_obj = matched_class or self._match_class(class_name, list(self._class_queryset(user)))
         if class_obj:
             return queryset.filter(name=student_name, class_obj=class_obj).first()
@@ -247,6 +346,145 @@ class ScoreViewSet(viewsets.ModelViewSet):
         students = queryset.filter(name=student_name)
         if students.count() == 1:
             return students.first()
+        return None
+
+    def _parse_text_records(self, user, text, subject, class_obj=None):
+        records = []
+        errors = []
+
+        for index, raw_line in enumerate(self._split_text_lines(text), start=1):
+            parsed = self._extract_name_score(raw_line)
+            if not parsed:
+                errors.append(f"第 {index} 行无法识别: {raw_line}")
+                continue
+
+            student = self._match_student_by_name(user, parsed["name"], class_obj=class_obj)
+            if not student:
+                errors.append(f"第 {index} 行未匹配到学生: {raw_line}")
+                continue
+
+            if parsed["score"] < 0 or parsed["score"] > subject.full_score:
+                errors.append(f"第 {index} 行分数超出范围: {raw_line}")
+                continue
+
+            records.append(
+                {
+                    "line_no": index,
+                    "raw_line": raw_line,
+                    "student_id": student.id,
+                    "student_name": student.name,
+                    "class_id": student.class_obj_id,
+                    "class_name": student.class_obj.name,
+                    "score": f"{parsed['score']:.1f}",
+                    "matched_by": parsed["matched_by"],
+                }
+            )
+
+        return records, errors
+
+    def _split_text_lines(self, text):
+        normalized = str(text or "").replace("\r", "\n")
+        chunks = []
+        for block in normalized.split("\n"):
+            block = block.strip()
+            if not block:
+                continue
+            for piece in re.split(r"[；;。]+", block):
+                piece = piece.strip(" ,，、")
+                if piece:
+                    chunks.append(piece)
+        return chunks
+
+    def _extract_name_score(self, raw_line):
+        line = str(raw_line).strip()
+        patterns = [
+            r"^(?P<name>[\u4e00-\u9fa5A-Za-z0-9·]{1,20})[\s,:：，、-]+(?P<score>[0-9]{1,3}(?:\.[0-9])?|[零一二三四五六七八九十百两点〇○]+)(?:分)?$",
+            r"^(?P<name>[\u4e00-\u9fa5A-Za-z0-9·]{1,20})(?P<score>[0-9]{1,3}(?:\.[0-9])?)(?:分)?$",
+        ]
+        for pattern in patterns:
+            matched = re.match(pattern, line)
+            if not matched:
+                continue
+            score = self._parse_score_value(matched.group("score"))
+            if score is None:
+                return None
+            return {"name": matched.group("name").strip(), "score": score, "matched_by": "name_or_pinyin"}
+        return None
+
+    def _parse_score_value(self, raw_value):
+        value = str(raw_value).strip()
+        try:
+            return Decimal(value)
+        except InvalidOperation:
+            pass
+
+        digits = {"零": 0, "〇": 0, "○": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        if "点" in value:
+            integer_part, decimal_part = value.split("点", 1)
+            integer_value = self._parse_chinese_integer(integer_part, digits)
+            if integer_value is None:
+                return None
+            decimal_digits = []
+            for char in decimal_part:
+                if char not in digits:
+                    return None
+                decimal_digits.append(str(digits[char]))
+            return Decimal(f"{integer_value}.{''.join(decimal_digits)}")
+
+        integer_value = self._parse_chinese_integer(value, digits)
+        if integer_value is None:
+            return None
+        return Decimal(integer_value)
+
+    def _parse_chinese_integer(self, value, digits):
+        if not value:
+            return 0
+        if value == "十":
+            return 10
+
+        total = 0
+        current = 0
+        units = {"十": 10, "百": 100}
+        for char in value:
+            if char in digits:
+                current = digits[char]
+            elif char in units:
+                if current == 0:
+                    current = 1
+                total += current * units[char]
+                current = 0
+            else:
+                return None
+        return total + current
+
+    def _match_student_by_name(self, user, raw_name, class_obj=None):
+        target = str(raw_name or "").strip()
+        if not target:
+            return None
+
+        queryset = self._student_queryset(user)
+        if class_obj:
+            queryset = queryset.filter(class_obj=class_obj)
+
+        exact = queryset.filter(name=target)
+        if exact.count() == 1:
+            return exact.first()
+
+        target_lower = target.lower()
+        exact_pinyin = []
+        fuzzy_pinyin = []
+        for student in queryset:
+            full_pinyin = "".join(lazy_pinyin(student.name)).lower()
+            initials = "".join(item[0][0] for item in pinyin(student.name, style=Style.FIRST_LETTER) if item and item[0]).lower()
+            if target_lower in {full_pinyin, initials}:
+                exact_pinyin.append(student)
+            elif full_pinyin.startswith(target_lower) or initials.startswith(target_lower):
+                fuzzy_pinyin.append(student)
+
+        if len(exact_pinyin) == 1:
+            return exact_pinyin[0]
+        if not exact.exists() and len(fuzzy_pinyin) == 1:
+            return fuzzy_pinyin[0]
         return None
 
     def _match_class(self, class_name, all_classes):
